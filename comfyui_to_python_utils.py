@@ -105,3 +105,10 @@ def get_value_at_index(obj: Union[Sequence, Mapping], index: int) -> Any:
         return obj[index]
     except KeyError:
         return obj["result"][index]
+
+
+def prepare_v3_node(cls):
+    """Prepare a V3 ComfyNode class clone with hidden holder so cls.hidden is not None."""
+    if hasattr(cls, 'PREPARE_CLASS_CLONE'):
+        return cls.PREPARE_CLASS_CLONE(None)
+    return cls

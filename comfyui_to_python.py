@@ -19,6 +19,7 @@ from comfyui_to_python_utils import (
     add_comfyui_directory_to_sys_path,
     add_extra_model_paths,
     get_value_at_index,
+    prepare_v3_node,
 )
 
 add_comfyui_directory_to_sys_path()
@@ -208,12 +209,15 @@ class CodeGenerator:
         initialized_objects = {}
 
         custom_nodes = False
+        has_v3_nodes = False
         # Loop over each dictionary in the load order list
         for idx, data, is_special_function in load_order:
             # Generate class definition and inputs from the data
             inputs, class_type = data["inputs"], data["class_type"]
             input_types = self.node_class_mappings[class_type].INPUT_TYPES()
             class_def = self.node_class_mappings[class_type]()
+            input_is_list = getattr(class_def, 'INPUT_IS_LIST', False)
+            is_v3_node = class_def.FUNCTION in ("EXECUTE_NORMALIZED", "EXECUTE_NORMALIZED_ASYNC")
 
             # If required inputs are not present, skip the node as it will break the code if passed through to the script
             missing_required_variable = False
@@ -231,8 +235,10 @@ class CodeGenerator:
                     continue
 
                 class_type, import_statement, class_code = self.get_class_info(
-                    class_type
+                    class_type, is_v3_node=is_v3_node
                 )
+                if is_v3_node:
+                    has_v3_nodes = True
                 initialized_objects[class_type] = self.clean_variable_name(class_type)
                 if class_type in self.base_node_class_mappings.keys():
                     import_statements.add(import_statement)
@@ -241,9 +247,11 @@ class CodeGenerator:
                 special_functions_code.append(class_code)
 
             # Get all possible parameters for class_def
-            class_def_params = self.get_function_parameters(
-                getattr(class_def, class_def.FUNCTION)
-            )
+            # For V3 nodes, EXECUTE_NORMALIZED uses **kwargs so we inspect the actual execute method instead
+            func_to_inspect = getattr(class_def, class_def.FUNCTION)
+            if is_v3_node and hasattr(class_def, 'execute'):
+                func_to_inspect = class_def.execute
+            class_def_params = self.get_function_parameters(func_to_inspect)
             no_params = class_def_params is None
 
             # Remove any keyword arguments from **inputs if they are not in class_def_params
@@ -253,17 +261,21 @@ class CodeGenerator:
                 if no_params or key in class_def_params
             }
             # Deal with hidden variables
-            if (
-                "hidden" in input_types.keys()
-                and "unique_id" in input_types["hidden"].keys()
-            ):
-                inputs["unique_id"] = random.randint(1, 2**64)
-            elif class_def_params is not None:
-                if "unique_id" in class_def_params:
+            # V3 nodes handle unique_id internally via cls.hidden, so don't inject it as a parameter
+            if not is_v3_node:
+                if (
+                    "hidden" in input_types.keys()
+                    and "unique_id" in input_types["hidden"].keys()
+                ):
                     inputs["unique_id"] = random.randint(1, 2**64)
+                elif class_def_params is not None:
+                    if "unique_id" in class_def_params:
+                        inputs["unique_id"] = random.randint(1, 2**64)
 
             # Create executed variable and generate code
-            executed_variables[idx] = f"{self.clean_variable_name(class_type)}_{idx}"
+            executed_variables[idx] = (
+                f"{self.clean_variable_name(class_type)}_{self.clean_variable_name(str(idx))}"
+            )
             inputs = self.update_inputs(inputs, executed_variables)
 
             if is_special_function:
@@ -273,6 +285,7 @@ class CodeGenerator:
                         class_def.FUNCTION,
                         executed_variables[idx],
                         is_special_function,
+                        input_is_list=input_is_list,
                         **inputs,
                     )
                 )
@@ -283,13 +296,14 @@ class CodeGenerator:
                         class_def.FUNCTION,
                         executed_variables[idx],
                         is_special_function,
+                        input_is_list=input_is_list,
                         **inputs,
                     )
                 )
 
         # Generate final code by combining imports and code, and wrap them in a main function
         final_code = self.assemble_python_code(
-            import_statements, special_functions_code, code, queue_size, custom_nodes
+            import_statements, special_functions_code, code, queue_size, custom_nodes, has_v3_nodes
         )
 
         return final_code
@@ -300,6 +314,7 @@ class CodeGenerator:
         func: str,
         variable_name: str,
         is_special_function: bool,
+        input_is_list: bool = False,
         **kwargs,
     ) -> str:
         """Generate Python code for a function call.
@@ -309,12 +324,13 @@ class CodeGenerator:
             func (str): The function to be called.
             variable_name (str): The name of the variable that the function result should be assigned to.
             is_special_function (bool): Determines the code indentation.
+            input_is_list (bool): Whether the node expects list-wrapped inputs.
             **kwargs: The keyword arguments for the function.
 
         Returns:
             str: The generated Python code.
         """
-        args = ", ".join(self.format_arg(key, value) for key, value in kwargs.items())
+        args = ", ".join(self.format_arg(key, value, wrap_in_list=input_is_list) for key, value in kwargs.items())
 
         # Generate the Python code
         code = f"{variable_name} = {obj_name}.{func}({args})\n"
@@ -326,24 +342,40 @@ class CodeGenerator:
 
         return code
 
-    def format_arg(self, key: str, value: any) -> str:
+    def format_arg(self, key: str, value: any, wrap_in_list: bool = False) -> str:
         """Formats arguments based on key and value.
 
         Args:
             key (str): Argument key.
             value (any): Argument value.
+            wrap_in_list (bool): Whether to wrap the value in a list (for INPUT_IS_LIST nodes).
 
         Returns:
             str: Formatted argument as a string.
         """
-        if key == "noise_seed" or key == "seed":
-            return f"{key}=random.randint(1, 2**64)"
+        # Clean the key to ensure it's a valid Python identifier
+        clean_key = self.clean_parameter_name(key)
+
+        if clean_key == "noise_seed" or clean_key == "seed":
+            val = "random.randint(1, 2**64)"
+            if wrap_in_list:
+                val = f"[{val}]"
+            return f"{clean_key}={val}"
         elif isinstance(value, str):
             value = value.replace("\n", "\\n").replace('"', "'")
-            return f'{key}="{value}"'
+            val = f'"{value}"'
+            if wrap_in_list:
+                val = f"[{val}]"
+            return f'{clean_key}={val}'
         elif isinstance(value, dict) and "variable_name" in value:
-            return f'{key}={value["variable_name"]}'
-        return f"{key}={value}"
+            val = value["variable_name"]
+            if wrap_in_list:
+                val = f"[{val}]"
+            return f'{clean_key}={val}'
+        val = f"{value}"
+        if wrap_in_list:
+            val = f"[{val}]"
+        return f"{clean_key}={val}"
 
     def assemble_python_code(
         self,
@@ -352,6 +384,7 @@ class CodeGenerator:
         code: List[str],
         queue_size: int,
         custom_nodes=False,
+        has_v3_nodes=False,
     ) -> str:
         """Generates the final code string.
 
@@ -361,6 +394,7 @@ class CodeGenerator:
             code (List[str]): A list of code strings.
             queue_size (int): Number of photos that will be generated by the script.
             custom_nodes (bool): Whether to include custom nodes in the code.
+            has_v3_nodes (bool): Whether the workflow contains V3 ComfyNodes.
 
         Returns:
             str: Generated final code as a string.
@@ -374,6 +408,9 @@ class CodeGenerator:
             add_extra_model_paths,
         ]:
             func_strings.append(f"\n{inspect.getsource(func)}")
+        # Include prepare_v3_node helper if workflow has V3 nodes
+        if has_v3_nodes:
+            func_strings.append(f"\n{inspect.getsource(prepare_v3_node)}")
         # Define static import statements required for the script
         static_imports = (
             [
@@ -415,21 +452,28 @@ class CodeGenerator:
 
         return final_code
 
-    def get_class_info(self, class_type: str) -> Tuple[str, str, str]:
+    def get_class_info(self, class_type: str, is_v3_node: bool = False) -> Tuple[str, str, str]:
         """Generates and returns necessary information about class type.
 
         Args:
             class_type (str): Class type.
+            is_v3_node (bool): Whether this is a V3 ComfyNode that needs prepare_v3_node.
 
         Returns:
             Tuple[str, str, str]: Updated class type, import statement string, class initialization code.
         """
         import_statement = class_type
         variable_name = self.clean_variable_name(class_type)
-        if class_type in self.base_node_class_mappings.keys():
-            class_code = f"{variable_name} = {class_type.strip()}()"
+        if is_v3_node:
+            if class_type in self.base_node_class_mappings.keys():
+                class_code = f"{variable_name} = prepare_v3_node({class_type.strip()})"
+            else:
+                class_code = f'{variable_name} = prepare_v3_node(NODE_CLASS_MAPPINGS["{class_type}"])'
         else:
-            class_code = f'{variable_name} = NODE_CLASS_MAPPINGS["{class_type}"]()'
+            if class_type in self.base_node_class_mappings.keys():
+                class_code = f"{variable_name} = {class_type.strip()}()"
+            else:
+                class_code = f'{variable_name} = NODE_CLASS_MAPPINGS["{class_type}"]()'
 
         return class_type, import_statement, class_code
 
@@ -444,16 +488,53 @@ class CodeGenerator:
         Returns:
             str: Cleaned variable name with no special characters or spaces
         """
-        # Convert to lowercase and replace spaces with underscores
-        clean_name = class_type.lower().strip().replace("-", "_").replace(" ", "_")
+        # Convert to lowercase and replace spaces, hyphens, and colons with underscores
+        clean_name = (
+            class_type.lower()
+            .strip()
+            .replace("-", "_")
+            .replace(" ", "_")
+            .replace(":", "_")
+        )
 
         # Remove characters that are not letters, numbers, or underscores
         clean_name = re.sub(r"[^a-z0-9_]", "", clean_name)
+
+        # If the name is empty after cleaning, provide a default
+        if not clean_name:
+            clean_name = "var"
 
         # Ensure that it doesn't start with a number
         if clean_name[0].isdigit():
             clean_name = "_" + clean_name
 
+        return clean_name
+
+    @staticmethod
+    def clean_parameter_name(param_name: str) -> str:
+        """
+        Clean parameter names to ensure they are valid Python identifiers.
+        
+        Args:
+            param_name (str): Original parameter name.
+            
+        Returns:
+            str: Cleaned parameter name that is a valid Python identifier.
+        """
+        # Convert to lowercase and replace spaces with underscores
+        clean_name = param_name.lower().strip().replace("-", "_").replace(" ", "_")
+        
+        # Remove characters that are not letters, numbers, or underscores (including emojis)
+        clean_name = re.sub(r"[^a-z0-9_]", "", clean_name)
+        
+        # Ensure that it doesn't start with a number
+        if clean_name and clean_name[0].isdigit():
+            clean_name = "_" + clean_name
+            
+        # If the name is empty after cleaning, provide a default
+        if not clean_name:
+            clean_name = "param"
+            
         return clean_name
 
     def get_function_parameters(self, func: Callable) -> List:

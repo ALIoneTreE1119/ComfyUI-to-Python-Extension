@@ -116,6 +116,12 @@ if __name__ == "__main__":
 - Creating large queues for image generation (For example, you could adjust the script to generate 1000 images without clicking ctrl+enter 1000 times)
 - Easily expanding or iterating on your architecture in Python once a foundational workflow is in place in the GUI
 
+## V1.4.0 Release Notes
+- **ComfyUI V3 Node Support**: V3 nodes (using `EXECUTE_NORMALIZED`) are now correctly handled. The generated scripts use `prepare_v3_node()` for proper initialization and parameter filtering.
+- **INPUT_IS_LIST Support**: Nodes with `INPUT_IS_LIST = True` now correctly wrap arguments in lists.
+- **Improved Parameter Filtering**: Frontend-only parameters (e.g., `audioui`, `unique_id`) are no longer passed to V3 node `execute()` methods.
+- **Special Character Handling**: Variable and parameter names containing colons, emojis, or other special characters are now properly sanitized.
+
 ## V1.3.0 Release Notes
 - Generate .py file directly from the ComfyUI Web App
 
