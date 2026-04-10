@@ -254,6 +254,12 @@ class CodeGenerator:
             class_def_params = self.get_function_parameters(func_to_inspect)
             no_params = class_def_params is None
 
+            # For V3 nodes, group dot-separated inputs (e.g. from DynamicCombo) into nested dicts
+            # before filtering. E.g. {"sampling_mode": "on", "sampling_mode.temperature": 0.7}
+            # becomes {"sampling_mode": {"sampling_mode": "on", "temperature": 0.7}}
+            if is_v3_node:
+                inputs = self.group_dynamic_inputs(inputs)
+
             # Remove any keyword arguments from **inputs if they are not in class_def_params
             inputs = {
                 key: value
@@ -372,10 +378,44 @@ class CodeGenerator:
             if wrap_in_list:
                 val = f"[{val}]"
             return f'{clean_key}={val}'
+        elif isinstance(value, dict):
+            val = self.format_dict_value(value)
+            if wrap_in_list:
+                val = f"[{val}]"
+            return f'{clean_key}={val}'
         val = f"{value}"
         if wrap_in_list:
             val = f"[{val}]"
         return f"{clean_key}={val}"
+
+    @staticmethod
+    def format_dict_value(d: dict) -> str:
+        """Format a dict value for generated Python code.
+
+        Handles string escaping, seed randomization, None values, and variable references properly.
+        Also handles nested dicts recursively.
+        """
+        items = []
+        for k, v in d.items():
+            key_repr = f'"{k}"'
+            if k == "seed" or k == "noise_seed":
+                val_repr = "random.randint(1, 2**64)"
+            elif isinstance(v, dict):
+                if "variable_name" in v:
+                    # This is a node reference that was converted by update_inputs
+                    val_repr = v["variable_name"]
+                else:
+                    # Nested dict, format recursively
+                    val_repr = CodeGenerator.format_dict_value(v)
+            elif isinstance(v, str):
+                escaped = v.replace("\n", "\\n").replace('"', "'")
+                val_repr = f'"{escaped}"'
+            elif v is None:
+                val_repr = "None"
+            else:
+                val_repr = repr(v)
+            items.append(f"{key_repr}: {val_repr}")
+        return "{" + ", ".join(items) + "}"
 
     def assemble_python_code(
         self,
@@ -557,6 +597,38 @@ class CodeGenerator:
         )
         return list(parameters.keys()) if not catch_all else None
 
+    @staticmethod
+    def group_dynamic_inputs(inputs: Dict) -> Dict:
+        """Group dot-separated dynamic inputs into nested dicts.
+
+        V3 nodes with DynamicCombo inputs store values in the workflow JSON as flat
+        dot-separated keys, e.g.:
+            {"sampling_mode": "on", "sampling_mode.temperature": 0.7, "sampling_mode.seed": 0}
+        ComfyUI's execution engine nests them into:
+            {"sampling_mode": {"sampling_mode": "on", "temperature": 0.7, "seed": 0}}
+        This method replicates that grouping for the code generator.
+        """
+        grouped = {}
+        nested_keys = {}
+        for key, value in inputs.items():
+            if "." in key:
+                parent, child = key.split(".", 1)
+                if parent not in nested_keys:
+                    nested_keys[parent] = {}
+                nested_keys[parent][child] = value
+            else:
+                grouped[key] = value
+        # Merge nested keys into their parent dicts
+        for parent, children in nested_keys.items():
+            if parent in grouped:
+                # Parent key exists (e.g. sampling_mode="on"), combine into dict
+                nested = {parent: grouped[parent]}
+                nested.update(children)
+                grouped[parent] = nested
+            else:
+                grouped[parent] = children
+        return grouped
+
     def update_inputs(self, inputs: Dict, executed_variables: Dict) -> Dict:
         """Update inputs based on the executed variables.
 
@@ -567,14 +639,26 @@ class CodeGenerator:
         Returns:
             Dict: Updated inputs dictionary.
         """
+
+        def process_value(value):
+            """Recursively process values to convert node references."""
+            if isinstance(value, list):
+                # Check if it's a node reference format ["node_id", output_index]
+                if len(value) == 2 and isinstance(value[0], str) and isinstance(value[1], int):
+                    # Check if the first element is a node ID in executed_variables
+                    if value[0] in executed_variables:
+                        return {
+                            "variable_name": f"get_value_at_index({executed_variables[value[0]]}, {value[1]})"
+                        }
+                # Otherwise, recursively process list elements
+                return [process_value(item) for item in value]
+            elif isinstance(value, dict):
+                # Recursively process dictionary values
+                return {k: process_value(v) for k, v in value.items()}
+            return value
+
         for key in inputs.keys():
-            if (
-                isinstance(inputs[key], list)
-                and inputs[key][0] in executed_variables.keys()
-            ):
-                inputs[key] = {
-                    "variable_name": f"get_value_at_index({executed_variables[inputs[key][0]]}, {inputs[key][1]})"
-                }
+            inputs[key] = process_value(inputs[key])
         return inputs
 
 
